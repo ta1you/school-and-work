@@ -430,7 +430,7 @@ function App() {
             )}
             
             <a 
-              href="http://localhost:5173" 
+              href="https://ta1you.github.io/life-os/"
               className="inline-block mt-4 text-[#94a3b8]/60 hover:text-[#f8fafc] hover:underline"
             >
               Life OS ログイン画面に戻る
@@ -458,7 +458,7 @@ function App() {
         </div>
         <div className="flex items-center gap-2">
           <a 
-            href="http://localhost:5173"
+            href="https://ta1you.github.io/life-os/"
             className="px-3 py-1.5 bg-[#1a1d24] text-xs font-semibold rounded-full border border-white/5 text-[#94a3b8] hover:text-[#f8fafc] transition-all"
           >
             Life OSに戻る
