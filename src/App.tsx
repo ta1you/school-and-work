@@ -673,8 +673,12 @@ function App() {
               </p>
             )}
             
-            <a 
-              href="http://localhost:5173"
+            <a
+              href={
+                window.location.hostname === "localhost"
+                  ? "http://localhost:5173/life-os/"
+                  : "https://ta1you.github.io/life-os/"
+              }
               className="inline-block mt-4 text-[#94a3b8]/60 hover:text-[#f8fafc] hover:underline"
             >
               Life OS ログイン画面に戻る
