@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAppStore } from './store/useAppStore';
-import type { Shift } from './store/useAppStore';
+import type { Shift, TimetableItem } from './store/useAppStore';
 import { auth } from './firebase';
 import { 
   signInWithEmailAndPassword, 
@@ -20,7 +20,8 @@ import {
   BookOpen, 
   Briefcase,
   LogOut,
-  AlertCircle
+  AlertCircle,
+  GripVertical
 } from 'lucide-react';
 
 function App() {
@@ -37,6 +38,15 @@ function App() {
   
   // School Sub-Tab: 'timetable' | 'assignments' | 'tests'
   const [schoolSubTab, setSchoolSubTab] = useState<'timetable' | 'assignments' | 'tests'>('timetable');
+  const [isSchoolSyncEnabled, setIsSchoolSyncEnabled] = useState(false);
+  const [isSchoolSyncPromptOpen, setIsSchoolSyncPromptOpen] = useState(false);
+  const [syncPeriodKey, setSyncPeriodKey] = useState<'this-week' | 'next-week' | 'next-two-weeks' | 'this-month'>('this-week');
+  const [isRegisteringToLifeOs, setIsRegisteringToLifeOs] = useState(false);
+
+  // Timetable Drag and Drop State
+  const [draggedCellItem, setDraggedCellItem] = useState<TimetableItem | null>(null);
+  const [dragOverCell, setDragOverCell] = useState<{ day: string; period: number } | null>(null);
+  const [isDraggingNow, setIsDraggingNow] = useState(false);
 
   // Zustand Store hooks
   const {
@@ -48,6 +58,8 @@ function App() {
     cleanup,
     saveTimetableCell,
     deleteTimetableCell,
+    registerTimetableForDates,
+    setSchoolSyncEnabled,
     addAssignment,
     toggleAssignment,
     deleteAssignment,
@@ -136,6 +148,157 @@ function App() {
       setActiveMainTab(tabParam);
     }
   }, []);
+
+  useEffect(() => {
+    setIsSchoolSyncEnabled(localStorage.getItem('school-life-os-sync') === 'enabled');
+  }, []);
+
+  const toggleSchoolSync = async () => {
+    if (!user) return;
+    const nextEnabled = !isSchoolSyncEnabled;
+    try {
+      await setSchoolSyncEnabled(user.uid, nextEnabled);
+      localStorage.setItem('school-life-os-sync', nextEnabled ? 'enabled' : 'disabled');
+      setIsSchoolSyncEnabled(nextEnabled);
+    } catch (err) {
+      console.error(err);
+      alert('連携設定の変更に失敗しました。');
+    }
+  };
+
+  type SyncPeriodKey = 'this-week' | 'next-week' | 'next-two-weeks' | 'this-month';
+
+  interface SyncTargetDate {
+    day: string;
+    date: Date;
+    dateStr: string;
+    displayDate: string;
+  }
+
+  const getPeriodTargetDates = (key: SyncPeriodKey): SyncTargetDate[] => {
+    const now = new Date();
+    const dayJaList = ['日', '月', '火', '水', '木', '金', '土'];
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const toTarget = (d: Date): SyncTargetDate => {
+      const year = d.getFullYear();
+      const month = d.getMonth() + 1;
+      const dayNum = d.getDate();
+      const dayJa = dayJaList[d.getDay()];
+      return {
+        day: dayJa,
+        date: new Date(year, month - 1, dayNum, 12, 0, 0),
+        dateStr: `${year}-${pad(month)}-${pad(dayNum)}`,
+        displayDate: `${month}/${dayNum} (${dayJa})`
+      };
+    };
+
+    if (key === 'this-week' || key === 'next-week' || key === 'next-two-weeks') {
+      const mondayOffset = now.getDay() === 0 ? -6 : 1 - now.getDay();
+      const weekShift = key === 'this-week' ? 0 : key === 'next-week' ? 7 : 14;
+      const result: SyncTargetDate[] = [];
+      for (let i = 0; i < 5; i++) {
+        const d = new Date(now);
+        d.setDate(now.getDate() + mondayOffset + weekShift + i);
+        result.push(toTarget(d));
+      }
+      return result;
+    }
+
+    if (key === 'this-month') {
+      const year = now.getFullYear();
+      const month = now.getMonth();
+      const lastDay = new Date(year, month + 1, 0).getDate();
+      const result: SyncTargetDate[] = [];
+      for (let i = 1; i <= lastDay; i++) {
+        const d = new Date(year, month, i);
+        if (d.getDay() >= 1 && d.getDay() <= 5) {
+          result.push(toTarget(d));
+        }
+      }
+      return result;
+    }
+
+    return [];
+  };
+
+  const currentSyncTargetDates = getPeriodTargetDates(syncPeriodKey);
+
+  const syncPeriodOptions: { key: SyncPeriodKey; label: string; rangeText: string }[] = [
+    (() => {
+      const dates = getPeriodTargetDates('this-week');
+      const start = dates[0]?.displayDate || '';
+      const end = dates[dates.length - 1]?.displayDate || '';
+      return {
+        key: 'this-week' as SyncPeriodKey,
+        label: '今週 (1週間)',
+        rangeText: `${start} 〜 ${end}`
+      };
+    })(),
+    (() => {
+      const dates = getPeriodTargetDates('next-week');
+      const start = dates[0]?.displayDate || '';
+      const end = dates[dates.length - 1]?.displayDate || '';
+      return {
+        key: 'next-week' as SyncPeriodKey,
+        label: '来週 (1週間)',
+        rangeText: `${start} 〜 ${end}`
+      };
+    })(),
+    (() => {
+      const dates = getPeriodTargetDates('next-two-weeks');
+      const start = dates[0]?.displayDate || '';
+      const end = dates[dates.length - 1]?.displayDate || '';
+      return {
+        key: 'next-two-weeks' as SyncPeriodKey,
+        label: '再来週 (1週間)',
+        rangeText: `${start} 〜 ${end}`
+      };
+    })(),
+    (() => {
+      const now = new Date();
+      const month = now.getMonth() + 1;
+      const dates = getPeriodTargetDates('this-month');
+      return {
+        key: 'this-month' as SyncPeriodKey,
+        label: `今月 (${month}月中・1か月)`,
+        rangeText: `平日全${dates.length}日間`
+      };
+    })()
+  ];
+
+  const syncPreviewItems = currentSyncTargetDates.map(target => {
+    const dayClasses = timetable
+      .filter(item => item.day === target.day)
+      .sort((a, b) => a.period - b.period);
+    return {
+      target,
+      classes: dayClasses
+    };
+  });
+  const totalClassesToRegister = syncPreviewItems.reduce((acc, curr) => acc + curr.classes.length, 0);
+
+  const handleRegisterTimetableToLifeOs = async () => {
+    if (!user || !isSchoolSyncEnabled) return;
+    if (totalClassesToRegister === 0) {
+      alert('登録対象の授業が時間割に登録されていません。先に時間割を入力してください。');
+      return;
+    }
+    setIsRegisteringToLifeOs(true);
+    try {
+      const count = await registerTimetableForDates(
+        user.uid,
+        timetable,
+        currentSyncTargetDates.map(t => ({ day: t.day, date: t.date }))
+      );
+      setIsSchoolSyncPromptOpen(false);
+      alert(`Life OSに ${count} 件の授業予定を登録しました！\nLife OS側で予定の確認や変更が可能です。`);
+    } catch (err) {
+      console.error(err);
+      alert('Life OSへの登録に失敗しました。');
+    } finally {
+      setIsRegisteringToLifeOs(false);
+    }
+  };
 
   // Firebase Auth Observer
   useEffect(() => {
@@ -280,6 +443,38 @@ function App() {
   const weekdays = ['月', '火', '水', '木', '金'];
   const periods = [1, 2, 3, 4, 5];
 
+  // Standard period times (授業時間)
+  const defaultPeriodTimes: Record<number, { startTime: string; endTime: string }> = {
+    1: { startTime: '09:10', endTime: '10:40' },
+    2: { startTime: '10:50', endTime: '12:20' },
+    3: { startTime: '13:10', endTime: '14:40' },
+    4: { startTime: '14:50', endTime: '16:20' },
+    5: { startTime: '16:30', endTime: '18:00' },
+  };
+
+  const handleApplyDefaultTimesToAll = async () => {
+    if (!user || timetable.length === 0) return;
+    if (!confirm('登録済みのすべての授業時間を標準時間（1限: 09:10〜, 2限: 10:50〜, 3限: 13:10〜, 4限: 14:50〜, 5限: 16:30〜）に更新しますか？')) {
+      return;
+    }
+    try {
+      for (const item of timetable) {
+        const def = defaultPeriodTimes[item.period];
+        if (def && (item.startTime !== def.startTime || item.endTime !== def.endTime)) {
+          await saveTimetableCell(user.uid, {
+            ...item,
+            startTime: def.startTime,
+            endTime: def.endTime
+          });
+        }
+      }
+      alert('すべての授業時間を標準時間に更新しました！');
+    } catch (err) {
+      console.error(err);
+      alert('授業時間の更新に失敗しました。');
+    }
+  };
+
   // Helper: Calculate remaining days
   const getRemainingDaysLabel = (targetDateStr: string) => {
     const todayDate = new Date();
@@ -305,6 +500,55 @@ function App() {
   // Helper: Find class for a specific day and period
   const findTimetableItem = (day: string, period: number) => {
     return timetable.find(t => t.day === day && t.period === period);
+  };
+
+  // Drag and Drop Handler for Timetable Cells
+  const handleDropOnCell = async (targetDay: string, targetPeriod: number) => {
+    setDragOverCell(null);
+    if (!draggedCellItem || !user) return;
+    if (draggedCellItem.day === targetDay && draggedCellItem.period === targetPeriod) {
+      return;
+    }
+
+    const targetExistingItem = findTimetableItem(targetDay, targetPeriod);
+    const targetPeriodTime = defaultPeriodTimes[targetPeriod] || { startTime: '09:10', endTime: '10:40' };
+    const sourcePeriodTime = defaultPeriodTimes[draggedCellItem.period] || { startTime: '09:10', endTime: '10:40' };
+
+    try {
+      if (targetExistingItem) {
+        // 2つのコマを入れ替え（スワップ）
+        await Promise.all([
+          saveTimetableCell(user.uid, {
+            ...draggedCellItem,
+            day: targetDay,
+            period: targetPeriod,
+            startTime: targetPeriodTime.startTime,
+            endTime: targetPeriodTime.endTime
+          }),
+          saveTimetableCell(user.uid, {
+            ...targetExistingItem,
+            day: draggedCellItem.day,
+            period: draggedCellItem.period,
+            startTime: sourcePeriodTime.startTime,
+            endTime: sourcePeriodTime.endTime
+          })
+        ]);
+      } else {
+        // 空きマスへの移動
+        await saveTimetableCell(user.uid, {
+          ...draggedCellItem,
+          day: targetDay,
+          period: targetPeriod,
+          startTime: targetPeriodTime.startTime,
+          endTime: targetPeriodTime.endTime
+        });
+      }
+    } catch (err) {
+      console.error('Drag and drop failed:', err);
+      alert('授業の移動に失敗しました。');
+    } finally {
+      setDraggedCellItem(null);
+    }
   };
 
   // Helper: Sort assignments
@@ -430,7 +674,7 @@ function App() {
             )}
             
             <a 
-              href="https://ta1you.github.io/life-os/"
+              href="http://localhost:5173"
               className="inline-block mt-4 text-[#94a3b8]/60 hover:text-[#f8fafc] hover:underline"
             >
               Life OS ログイン画面に戻る
@@ -458,7 +702,7 @@ function App() {
         </div>
         <div className="flex items-center gap-2">
           <a 
-            href="https://ta1you.github.io/life-os/"
+            href="http://localhost:5173"
             className="px-3 py-1.5 bg-[#1a1d24] text-xs font-semibold rounded-full border border-white/5 text-[#94a3b8] hover:text-[#f8fafc] transition-all"
           >
             Life OSに戻る
@@ -546,56 +790,148 @@ function App() {
               <div className="space-y-4">
                 <div className="flex justify-between items-center">
                   <h3 className="font-bold text-sm text-[#94a3b8]">今学期の時間割</h3>
-                  <span className="text-[10px] bg-[#4b88ff]/10 text-[#4b88ff] px-2.5 py-1 rounded-full font-bold border border-[#4b88ff]/10">自動Life OS連携</span>
+                  <button
+                    type="button"
+                    onClick={toggleSchoolSync}
+                    className={`text-[10px] px-2.5 py-1 rounded-full font-bold border transition-all ${
+                      isSchoolSyncEnabled
+                        ? 'bg-[#34d399]/10 text-[#34d399] border-[#34d399]/20'
+                        : 'bg-white/5 text-[#94a3b8] border-white/10'
+                    }`}
+                  >
+                    Life OS連携: {isSchoolSyncEnabled ? 'ON' : 'OFF'}
+                  </button>
                 </div>
+
+                {isSchoolSyncEnabled && (
+                  <button
+                    type="button"
+                    onClick={() => setIsSchoolSyncPromptOpen(true)}
+                    className="w-full py-2.5 bg-[#4b88ff] hover:bg-[#3b78ef] text-white font-bold rounded-xl text-xs shadow-md shadow-[#4b88ff]/10 active:scale-[0.99] transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <CalendarIcon className="w-3.5 h-3.5" />
+                    期間を選んで時間割をLife OSに登録
+                  </button>
+                )}
 
                 {/* Timetable Grid */}
                 <div className="overflow-x-auto border border-white/5 rounded-2xl bg-[#1a1d24]">
                   <table className="w-full border-collapse text-xs text-center min-w-[320px]">
                     <thead>
                       <tr className="border-b border-white/5 bg-[#0f1115]/40 text-[#94a3b8] font-bold">
-                        <th className="py-2.5 w-10 border-r border-white/5">限</th>
+                        <th className="py-2.5 w-14 border-r border-white/5 text-[10px]">時限</th>
                         {weekdays.map(day => (
                           <th key={day} className="py-2.5 border-r border-white/5 last:border-r-0">{day}</th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
-                      {periods.map(period => (
-                        <tr key={period} className="border-b border-white/5 last:border-b-0">
-                          <td className="py-4 font-bold border-r border-white/5 bg-[#0f1115]/20 text-[#94a3b8]">{period}</td>
-                          {weekdays.map(day => {
-                            const item = findTimetableItem(day, period);
-                            return (
-                              <td 
-                                key={day} 
-                                onClick={() => setEditingCell(item ? { ...item } : { day, period, subject: '', startTime: '10:50', endTime: '12:20' })}
-                                className="p-1.5 border-r border-white/5 last:border-r-0 cursor-pointer hover:bg-white/[0.02] transition-all"
-                              >
-                                {item ? (
-                                  <div className="bg-[#4b88ff]/10 border border-[#4b88ff]/20 text-[#4b88ff] p-2 rounded-lg font-bold text-[10px] min-h-[56px] flex flex-col justify-center">
-                                    <div className="line-clamp-2">{item.subject}</div>
-                                    <div className="text-[8px] text-[#4b88ff]/80 font-normal mt-1 flex items-center justify-center gap-0.5">
-                                      <Clock className="w-2 h-2" />
-                                      {item.startTime}
+                      {periods.map(period => {
+                        const periodDefault = defaultPeriodTimes[period] || { startTime: '09:10', endTime: '10:40' };
+                        return (
+                          <tr key={period} className="border-b border-white/5 last:border-b-0">
+                            <td className="py-2.5 px-1 font-bold border-r border-white/5 bg-[#0f1115]/20 text-[#94a3b8] text-center">
+                              <span className="text-xs">{period}限</span>
+                              <span className="block text-[8px] text-[#94a3b8]/60 font-normal leading-tight mt-0.5 whitespace-nowrap">
+                                {periodDefault.startTime}
+                                <br />
+                                {periodDefault.endTime}
+                              </span>
+                            </td>
+                            {weekdays.map(day => {
+                              const item = findTimetableItem(day, period);
+                              const isTargetOver = dragOverCell?.day === day && dragOverCell?.period === period;
+                              const isBeingDragged = draggedCellItem?.id === item?.id;
+
+                              return (
+                                <td 
+                                  key={day} 
+                                  onDragOver={(e) => {
+                                    e.preventDefault();
+                                    e.dataTransfer.dropEffect = 'move';
+                                    if (dragOverCell?.day !== day || dragOverCell?.period !== period) {
+                                      setDragOverCell({ day, period });
+                                    }
+                                  }}
+                                  onDragLeave={(e) => {
+                                    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                                    setDragOverCell(null);
+                                  }}
+                                  onDrop={(e) => {
+                                    e.preventDefault();
+                                    handleDropOnCell(day, period);
+                                  }}
+                                  onClick={() => {
+                                    if (isDraggingNow) return;
+                                    setEditingCell(item ? { ...item } : { day, period, subject: '', startTime: periodDefault.startTime, endTime: periodDefault.endTime });
+                                  }}
+                                  className={`p-1.5 border-r border-white/5 last:border-r-0 cursor-pointer transition-all ${
+                                    isTargetOver
+                                      ? 'bg-[#4b88ff]/15 ring-2 ring-inset ring-[#4b88ff] rounded-xl'
+                                      : 'hover:bg-white/[0.02]'
+                                  }`}
+                                >
+                                  {item ? (
+                                    <div 
+                                      draggable={true}
+                                      onDragStart={(e) => {
+                                        setDraggedCellItem(item);
+                                        setIsDraggingNow(true);
+                                        e.dataTransfer.effectAllowed = 'move';
+                                        e.dataTransfer.setData('text/plain', item.id);
+                                      }}
+                                      onDragEnd={() => {
+                                        setDraggedCellItem(null);
+                                        setDragOverCell(null);
+                                        setTimeout(() => setIsDraggingNow(false), 80);
+                                      }}
+                                      className={`bg-[#4b88ff]/10 border border-[#4b88ff]/20 text-[#4b88ff] p-2 rounded-lg font-bold text-[10px] min-h-[56px] flex flex-col justify-center relative group cursor-grab active:cursor-grabbing hover:border-[#4b88ff]/40 hover:bg-[#4b88ff]/15 transition-all ${
+                                        isBeingDragged ? 'opacity-30 scale-95' : ''
+                                      }`}
+                                    >
+                                      <div className="flex items-center justify-between gap-1">
+                                        <span className="line-clamp-2 text-left flex-1">{item.subject}</span>
+                                        <GripVertical className="w-2.5 h-2.5 opacity-30 group-hover:opacity-80 transition-opacity shrink-0 -mr-0.5" />
+                                      </div>
+                                      <div className="text-[8px] text-[#4b88ff]/80 font-normal mt-1 flex items-center justify-center gap-0.5">
+                                        <Clock className="w-2 h-2" />
+                                        {item.startTime} - {item.endTime}
+                                      </div>
                                     </div>
-                                  </div>
-                                ) : (
-                                  <div className="border border-dashed border-white/5 hover:border-white/10 text-white/10 hover:text-white/30 p-2 rounded-lg min-h-[56px] flex items-center justify-center transition-all">
-                                    <Plus className="w-4 h-4" />
-                                  </div>
-                                )}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))}
+                                  ) : (
+                                    <div className={`border border-dashed p-2 rounded-lg min-h-[56px] flex items-center justify-center transition-all ${
+                                      isTargetOver 
+                                        ? 'border-[#4b88ff] text-[#4b88ff] bg-[#4b88ff]/10 scale-95'
+                                        : 'border-white/5 hover:border-white/10 text-white/10 hover:text-white/30'
+                                    }`}>
+                                      {isTargetOver ? (
+                                        <span className="text-[9px] font-bold text-[#4b88ff]">移動</span>
+                                      ) : (
+                                        <Plus className="w-4 h-4" />
+                                      )}
+                                    </div>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
 
-                <div className="text-[10px] text-[#94a3b8] bg-[#1a1d24] border border-white/5 p-4 rounded-xl leading-relaxed">
-                  💡 **時間割の使い方**: 空いている時限のマスをクリックすると、授業名と時間を新しく登録できます。登録された授業は、毎週その曜日になると**Life OS側へ自動的に連携・表示**されます。
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-[10px] text-[#94a3b8] bg-[#1a1d24] border border-white/5 p-3.5 rounded-xl">
+                  <span>💡 授業カードをドラッグ＆ドロップして、別の曜日や時限に移動・入れ替えできます（時間は自動調整されます）</span>
+                  {timetable.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleApplyDefaultTimesToAll}
+                      className="text-[#4b88ff] hover:underline font-bold whitespace-nowrap cursor-pointer"
+                    >
+                      時間を一括更新
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -946,7 +1282,19 @@ function App() {
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-[10px] font-bold text-[#94a3b8] mb-2 uppercase tracking-wider">開始時間</label>
+                  <div className="flex justify-between items-center mb-2">
+                    <label className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider">開始時間</label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const def = defaultPeriodTimes[editingCell.period];
+                        if (def) setEditingCell({ ...editingCell, startTime: def.startTime, endTime: def.endTime });
+                      }}
+                      className="text-[9px] text-[#4b88ff] hover:underline cursor-pointer"
+                    >
+                      標準時間を適用
+                    </button>
+                  </div>
                   <input 
                     type="time" 
                     required
@@ -1118,6 +1466,124 @@ function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* LIFE OS TIMETABLE SYNC MODAL */}
+      {isSchoolSyncPromptOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-[#1a1d24] border border-white/5 rounded-3xl p-6 shadow-2xl space-y-5">
+            <div className="flex justify-between items-center pb-2 border-b border-white/5">
+              <div className="flex items-center gap-2">
+                <span className="text-base">📅</span>
+                <h3 className="font-extrabold text-sm text-[#f8fafc]">
+                  時間割をLife OSに登録
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsSchoolSyncPromptOpen(false)}
+                className="text-[#94a3b8] hover:text-[#f8fafc] p-1 rounded-lg hover:bg-white/5 transition-all text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-[10px] font-bold text-[#94a3b8] mb-2 uppercase tracking-wider">
+                  登録対象の期間を選択
+                </label>
+                <select
+                  className="w-full px-4 py-2.5 bg-[#0f1115] border border-white/10 rounded-xl text-xs text-[#f8fafc] focus:outline-none focus:border-[#4b88ff] transition-all cursor-pointer"
+                  value={syncPeriodKey}
+                  onChange={e => setSyncPeriodKey(e.target.value as SyncPeriodKey)}
+                >
+                  {syncPeriodOptions.map(opt => (
+                    <option key={opt.key} value={opt.key}>
+                      {opt.label} ({opt.rangeText})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Preview Box */}
+              <div>
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider">
+                    登録内容のプレビュー
+                  </span>
+                  <span className="text-[10px] bg-[#4b88ff]/15 text-[#4b88ff] px-2 py-0.5 rounded-full font-bold border border-[#4b88ff]/20">
+                    計 {totalClassesToRegister} コマ
+                  </span>
+                </div>
+
+                <div className="max-h-56 overflow-y-auto space-y-2 pr-1 border border-white/5 bg-[#0f1115] p-3 rounded-2xl text-xs">
+                  {syncPreviewItems.every(p => p.classes.length === 0) ? (
+                    <div className="text-center py-6 text-xs text-[#94a3b8]">
+                      時間割に登録された授業がありません。<br />
+                      先に時間割に授業を追加してください。
+                    </div>
+                  ) : (
+                    syncPreviewItems.map((item, idx) => {
+                      if (item.classes.length === 0) return null;
+                      return (
+                        <div key={idx} className="bg-[#1a1d24] border border-white/5 rounded-xl p-2.5 space-y-1.5">
+                          <div className="flex items-center justify-between text-[11px] font-bold text-[#94a3b8]">
+                            <span>{item.target.displayDate}</span>
+                            <span className="text-[10px] text-white/50">{item.classes.length}コマ</span>
+                          </div>
+                          <div className="space-y-1">
+                            {item.classes.map(c => (
+                              <div
+                                key={c.id || `${c.day}-${c.period}`}
+                                className="flex items-center justify-between bg-white/5 px-2.5 py-1.5 rounded-lg text-xs"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] bg-[#4b88ff]/20 text-[#4b88ff] px-1.5 py-0.5 rounded font-bold">
+                                    {c.period}限
+                                  </span>
+                                  <span className="font-medium text-[#f8fafc]">{c.subject}</span>
+                                </div>
+                                <span className="text-[10px] text-[#94a3b8]">{c.startTime} - {c.endTime}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              <div className="text-[10px] text-[#94a3b8] bg-[#0f1115]/60 border border-white/5 p-3 rounded-xl leading-relaxed">
+                💡 登録すると Life OS のカレンダーに授業予定が追加されます。特定の週に予定がない場合や休講の場合は、登録後に Life OS 側で個別に予定を削除・変更できます。
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={isRegisteringToLifeOs}
+                  onClick={() => setIsSchoolSyncPromptOpen(false)}
+                  className="flex-1 py-2.5 bg-[#1a1d24] text-xs font-bold rounded-xl border border-white/5 text-[#94a3b8] hover:text-[#f8fafc] transition-all disabled:opacity-50"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="button"
+                  disabled={isRegisteringToLifeOs || totalClassesToRegister === 0}
+                  onClick={handleRegisterTimetableToLifeOs}
+                  className="flex-1 py-2.5 bg-[#4b88ff] hover:bg-[#3b78ef] text-white font-bold rounded-xl text-xs shadow-md shadow-[#4b88ff]/10 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {isRegisteringToLifeOs ? (
+                    <span>登録中...</span>
+                  ) : (
+                    <span>Life OSに登録する ({totalClassesToRegister}コマ)</span>
+                  )}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

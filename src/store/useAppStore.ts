@@ -58,6 +58,9 @@ interface AppState {
 
   saveTimetableCell: (uid: string, item: Omit<TimetableItem, 'id'> & { id?: string }) => Promise<void>;
   deleteTimetableCell: (uid: string, id: string) => Promise<void>;
+  registerTimetableForDates: (uid: string, timetable: TimetableItem[], targetDates: { day: string; date: Date }[]) => Promise<number>;
+  registerTimetableForWeek: (uid: string, timetable: TimetableItem[], weekDates: { day: string; date: Date }[]) => Promise<void>;
+  setSchoolSyncEnabled: (uid: string, enabled: boolean) => Promise<void>;
   
   addAssignment: (uid: string, assignment: Omit<Assignment, 'id' | 'completed'>) => Promise<void>;
   toggleAssignment: (uid: string, id: string, completed: boolean) => Promise<void>;
@@ -146,6 +149,42 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   deleteTimetableCell: async (uid, id) => {
     await deleteDoc(doc(db, 'school', uid, 'timetable', id));
+  },
+
+  registerTimetableForDates: async (uid, timetable, targetDates) => {
+    let count = 0;
+    const tasks = targetDates.flatMap(({ day, date }) => {
+      const items = timetable.filter(item => item.day === day);
+      return items.map(item => {
+        count++;
+        const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        const scheduleRef = doc(db, 'users', uid, 'schedules', `school-${dateKey}-${item.id}`);
+        return setDoc(scheduleRef, {
+          title: `${item.subject} (学校)`,
+          timeStart: item.startTime,
+          timeEnd: item.endTime,
+          color: '#3b82f6',
+          date: date.toISOString(),
+          isSchool: true,
+          source: 'school-timetable',
+          timetableId: item.id,
+          registeredDate: dateKey
+        });
+      });
+    });
+    await Promise.all(tasks);
+    return count;
+  },
+
+  registerTimetableForWeek: async (uid, timetable, weekDates) => {
+    await get().registerTimetableForDates(uid, timetable, weekDates);
+  },
+
+  setSchoolSyncEnabled: async (uid, enabled) => {
+    await setDoc(doc(db, 'school', uid, 'settings', 'lifeOsSync'), {
+      enabled,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
   },
 
   addAssignment: async (uid, assignment) => {
