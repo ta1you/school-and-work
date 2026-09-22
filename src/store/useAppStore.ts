@@ -59,6 +59,7 @@ interface AppState {
   saveTimetableCell: (uid: string, item: Omit<TimetableItem, 'id'> & { id?: string }) => Promise<void>;
   deleteTimetableCell: (uid: string, id: string) => Promise<void>;
   registerTimetableForDates: (uid: string, timetable: TimetableItem[], targetDates: { day: string; date: Date }[]) => Promise<number>;
+  deleteTimetableForDates: (uid: string, timetable: TimetableItem[], targetDates: { day: string; date: Date }[]) => Promise<number>;
   registerTimetableForWeek: (uid: string, timetable: TimetableItem[], weekDates: { day: string; date: Date }[]) => Promise<void>;
   setSchoolSyncEnabled: (uid: string, enabled: boolean) => Promise<void>;
   
@@ -170,6 +171,21 @@ export const useAppStore = create<AppState>((set, get) => ({
           timetableId: item.id,
           registeredDate: dateKey
         });
+      });
+    });
+    await Promise.all(tasks);
+    return count;
+  },
+
+  deleteTimetableForDates: async (uid, timetable, targetDates) => {
+    let count = 0;
+    const tasks = targetDates.flatMap(({ day, date }) => {
+      const items = timetable.filter(item => item.day === day);
+      return items.map(item => {
+        count++;
+        const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        const scheduleRef = doc(db, 'users', uid, 'schedules', `school-${dateKey}-${item.id}`);
+        return deleteDoc(scheduleRef);
       });
     });
     await Promise.all(tasks);

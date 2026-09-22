@@ -42,6 +42,7 @@ function App() {
   const [isSchoolSyncPromptOpen, setIsSchoolSyncPromptOpen] = useState(false);
   const [syncPeriodKey, setSyncPeriodKey] = useState<'this-week' | 'next-week' | 'next-two-weeks' | 'this-month'>('this-week');
   const [isRegisteringToLifeOs, setIsRegisteringToLifeOs] = useState(false);
+  const [isDeletingFromLifeOs, setIsDeletingFromLifeOs] = useState(false);
 
   // Timetable Drag and Drop State
   const [draggedCellItem, setDraggedCellItem] = useState<TimetableItem | null>(null);
@@ -59,6 +60,7 @@ function App() {
     saveTimetableCell,
     deleteTimetableCell,
     registerTimetableForDates,
+    deleteTimetableForDates,
     setSchoolSyncEnabled,
     addAssignment,
     toggleAssignment,
@@ -297,6 +299,33 @@ function App() {
       alert('Life OSへの登録に失敗しました。');
     } finally {
       setIsRegisteringToLifeOs(false);
+    }
+  };
+
+  const handleDeleteTimetableFromLifeOs = async () => {
+    if (!user || !isSchoolSyncEnabled) return;
+    const selectedOption = syncPeriodOptions.find(o => o.key === syncPeriodKey);
+    const periodLabel = selectedOption ? `${selectedOption.label}（${selectedOption.rangeText}）` : '選択中の期間';
+
+    const isConfirmed = window.confirm(
+      `【確認】\nLife OSから「${periodLabel}」の授業予定を一括削除しますか？\n\n※この期間に時間割から登録された学校授業の予定（最大 ${totalClassesToRegister} 件）がカレンダーから取り消されます。\n※個別に編集したメモなども削除されます。`
+    );
+    if (!isConfirmed) return;
+
+    setIsDeletingFromLifeOs(true);
+    try {
+      const count = await deleteTimetableForDates(
+        user.uid,
+        timetable,
+        currentSyncTargetDates.map(t => ({ day: t.day, date: t.date }))
+      );
+      setIsSchoolSyncPromptOpen(false);
+      alert(`Life OSから該当期間の授業予定（${count}コマ分）を取り消し・削除しました。`);
+    } catch (err) {
+      console.error(err);
+      alert('Life OSからの予定削除に失敗しました。');
+    } finally {
+      setIsDeletingFromLifeOs(false);
     }
   };
 
@@ -1569,25 +1598,40 @@ function App() {
                 💡 登録すると Life OS のカレンダーに授業予定が追加されます。特定の週に予定がない場合や休講の場合は、登録後に Life OS 側で個別に予定を削除・変更できます。
               </div>
 
-              <div className="flex gap-2 pt-2">
+              <div className="flex flex-col gap-2 pt-2">
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    disabled={isRegisteringToLifeOs || isDeletingFromLifeOs}
+                    onClick={() => setIsSchoolSyncPromptOpen(false)}
+                    className="flex-1 py-2.5 bg-[#1a1d24] text-xs font-bold rounded-xl border border-white/5 text-[#94a3b8] hover:text-[#f8fafc] transition-all disabled:opacity-50"
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isRegisteringToLifeOs || isDeletingFromLifeOs || totalClassesToRegister === 0}
+                    onClick={handleRegisterTimetableToLifeOs}
+                    className="flex-1 py-2.5 bg-[#4b88ff] hover:bg-[#3b78ef] text-white font-bold rounded-xl text-xs shadow-md shadow-[#4b88ff]/10 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  >
+                    {isRegisteringToLifeOs ? (
+                      <span>登録中...</span>
+                    ) : (
+                      <span>Life OSに登録する ({totalClassesToRegister}コマ)</span>
+                    )}
+                  </button>
+                </div>
+
                 <button
                   type="button"
-                  disabled={isRegisteringToLifeOs}
-                  onClick={() => setIsSchoolSyncPromptOpen(false)}
-                  className="flex-1 py-2.5 bg-[#1a1d24] text-xs font-bold rounded-xl border border-white/5 text-[#94a3b8] hover:text-[#f8fafc] transition-all disabled:opacity-50"
+                  disabled={isRegisteringToLifeOs || isDeletingFromLifeOs || totalClassesToRegister === 0}
+                  onClick={handleDeleteTimetableFromLifeOs}
+                  className="w-full py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 rounded-xl text-[11px] font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
                 >
-                  キャンセル
-                </button>
-                <button
-                  type="button"
-                  disabled={isRegisteringToLifeOs || totalClassesToRegister === 0}
-                  onClick={handleRegisterTimetableToLifeOs}
-                  className="flex-1 py-2.5 bg-[#4b88ff] hover:bg-[#3b78ef] text-white font-bold rounded-xl text-xs shadow-md shadow-[#4b88ff]/10 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                >
-                  {isRegisteringToLifeOs ? (
-                    <span>登録中...</span>
+                  {isDeletingFromLifeOs ? (
+                    <span>削除中...</span>
                   ) : (
-                    <span>Life OSに登録する ({totalClassesToRegister}コマ)</span>
+                    <span>🗑️ この期間の授業予定をLife OSから一括削除・取り消す</span>
                   )}
                 </button>
               </div>
