@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAppStore } from './store/useAppStore';
-import type { Shift, TimetableItem } from './store/useAppStore';
+import type { Shift, TimetableItem, ClassType } from './store/useAppStore';
 import { auth } from './firebase';
 import { 
   signInWithEmailAndPassword, 
@@ -21,7 +21,9 @@ import {
   Briefcase,
   LogOut,
   AlertCircle,
-  GripVertical
+  GripVertical,
+  MapPin,
+  ExternalLink
 } from 'lucide-react';
 
 function App() {
@@ -43,6 +45,35 @@ function App() {
   const [syncPeriodKey, setSyncPeriodKey] = useState<'this-week' | 'next-week' | 'next-two-weeks' | 'this-month'>('this-week');
   const [isRegisteringToLifeOs, setIsRegisteringToLifeOs] = useState(false);
   const [isDeletingFromLifeOs, setIsDeletingFromLifeOs] = useState(false);
+  const [defaultClassType, setDefaultClassType] = useState<ClassType>(() => {
+    return (localStorage.getItem('school_default_class_type') as ClassType) || 'zoom';
+  });
+
+  const handleSetDefaultClassType = (type: ClassType) => {
+    setDefaultClassType(type);
+    localStorage.setItem('school_default_class_type', type);
+  };
+
+  const handleUpdateAllClassType = async (targetType: ClassType = defaultClassType) => {
+    if (!user) return;
+    const typeLabel = targetType === 'zoom' ? '💻 Zoom' : targetType === 'ondemand' ? '📺 オンデマンド' : '🏫 対面';
+    if (timetable.length === 0) {
+      alert('時間割に授業がまだ登録されていません。');
+      return;
+    }
+    const isConfirmed = window.confirm(
+      `【確認】\n現在時間割に登録されているすべての授業（${timetable.length}コマ）の受講スタイルを一括で「${typeLabel}」に変更しますか？`
+    );
+    if (!isConfirmed) return;
+
+    try {
+      const count = await updateAllTimetableClassType(user.uid, targetType);
+      alert(`時間割の全授業（${count}コマ）を一括で「${typeLabel}」に変更しました！`);
+    } catch (err) {
+      console.error(err);
+      alert('一括変更に失敗しました。');
+    }
+  };
 
   // Timetable Drag and Drop State
   const [draggedCellItem, setDraggedCellItem] = useState<TimetableItem | null>(null);
@@ -58,6 +89,7 @@ function App() {
     initData,
     cleanup,
     saveTimetableCell,
+    updateAllTimetableClassType,
     deleteTimetableCell,
     registerTimetableForDates,
     deleteTimetableForDates,
@@ -80,7 +112,18 @@ function App() {
     subject: string;
     startTime: string;
     endTime: string;
+    classType?: ClassType;
+    classroom?: string;
   } | null>(null);
+
+  // Bulk Timetable Edit State
+  const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
+  const [bulkCells, setBulkCells] = useState<Record<string, string>>({});
+  const [bulkPasteText, setBulkPasteText] = useState('');
+  const [timetableImage, setTimetableImage] = useState<File | null>(null);
+  const [isReadingTimetable, setIsReadingTimetable] = useState(false);
+  const [timetableReadError, setTimetableReadError] = useState('');
+  const [geminiApiKey, setGeminiApiKey] = useState(() => localStorage.getItem('sw_gemini_api_key') || '');
 
   // Add Assignment Form State
   const [newAssignmentTitle, setNewAssignmentTitle] = useState('');
@@ -504,6 +547,128 @@ function App() {
     }
   };
 
+  // ==================== 時間割 一括入力 ====================
+  const openBulkEditTimetable = () => {
+    const cells: Record<string, string> = {};
+    weekdays.forEach(day => {
+      periods.forEach(period => {
+        cells[`${day}-${period}`] = findTimetableItem(day, period)?.subject || '';
+      });
+    });
+    setBulkCells(cells);
+    setBulkPasteText('');
+    setTimetableImage(null);
+    setTimetableReadError('');
+    setIsBulkEditOpen(true);
+  };
+
+  const handleBulkSaveTimetable = async () => {
+    if (!user) return;
+    try {
+      let changed = 0;
+      for (const day of weekdays) {
+        for (const period of periods) {
+          const subject = (bulkCells[`${day}-${period}`] || '').trim();
+          const existing = findTimetableItem(day, period);
+          if (subject && existing) {
+            if (existing.subject !== subject) {
+              await saveTimetableCell(user.uid, { ...existing, subject });
+              changed++;
+            }
+          } else if (subject && !existing) {
+            const def = defaultPeriodTimes[period] || { startTime: '09:10', endTime: '10:40' };
+            await saveTimetableCell(user.uid, { day, period, subject, startTime: def.startTime, endTime: def.endTime });
+            changed++;
+          } else if (!subject && existing) {
+            await deleteTimetableCell(user.uid, existing.id);
+            changed++;
+          }
+        }
+      }
+      setIsBulkEditOpen(false);
+      alert(changed > 0 ? `時間割を保存しました(${changed}件)。授業時間は標準時間で登録されています。` : '変更はありませんでした。');
+    } catch (err) {
+      console.error(err);
+      alert('時間割の一括保存に失敗しました。');
+    }
+  };
+
+  const applyBulkPasteText = () => {
+    const lines = bulkPasteText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length === 0) return;
+    const daySet = new Set(weekdays);
+    const toHalfWidth = (s: string) => s.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+    const cells = { ...bulkCells };
+    let applied = 0;
+    const badLines: number[] = [];
+    lines.forEach((line, idx) => {
+      const tokens = line.split(/[\s,、\t]+/).filter(Boolean);
+      if (tokens.length < 3) { badLines.push(idx + 1); return; }
+      const day = daySet.has(tokens[0]) ? tokens[0] : '';
+      const period = Number(toHalfWidth(tokens[1]).replace(/限/g, ''));
+      const subject = tokens.slice(2).join(' ');
+      if (!day || !period || period < 1 || period > 5 || !subject) { badLines.push(idx + 1); return; }
+      cells[`${day}-${period}`] = subject;
+      applied++;
+    });
+    setBulkCells(cells);
+    if (badLines.length > 0) {
+      alert(`${applied}件を反映しました。読み取れない行: ${badLines.join(', ')}行目\n※「月 1 科目名」の形式で入力してください。`);
+    }
+  };
+
+  const handleReadTimetablePhoto = async () => {
+    if (!timetableImage) return;
+    if (!geminiApiKey) { setTimetableReadError('Gemini APIキーを入力してください。'); return; }
+    setIsReadingTimetable(true);
+    setTimetableReadError('');
+    try {
+      localStorage.setItem('sw_gemini_api_key', geminiApiKey);
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error('画像の読み込みに失敗しました。'));
+        reader.readAsDataURL(timetableImage);
+      });
+      const base64 = dataUrl.split(',')[1];
+      const mimeMatch = dataUrl.match(/^data:(.*?);/);
+      const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+      const prompt = 'これは学校の時間割の画像です。曜日のブロックは上から月,火,水,木,金の順、各ブロック内の行は上から1限,2限,3限,4限,5限の順として科目名を読み取ってください。空欄のマスは含めないでください。科目名に含まれる「※」以降の注釈は除いてください。次の形式のJSON配列のみを出力してください(説明文やコードブロック記号は不要): [{"day":"月","period":1,"subject":"科目名"}]';
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(geminiApiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: mimeType, data: base64 } }] }],
+          generationConfig: { temperature: 0 }
+        })
+      });
+      if (!res.ok) {
+        throw new Error(`Gemini APIエラー (${res.status})`);
+      }
+      const json = await res.json();
+      const text: string = (json?.candidates?.[0]?.content?.parts || []).map((p: { text?: string }) => p.text || '').join('');
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) throw new Error('読み取り結果を解析できませんでした。');
+      const entries: { day: string; period: number; subject: string }[] = JSON.parse(jsonMatch[0]);
+      const cells = { ...bulkCells };
+      let count = 0;
+      entries.forEach(e => {
+        if (weekdays.includes(e.day) && e.period >= 1 && e.period <= 5 && e.subject) {
+          cells[`${e.day}-${e.period}`] = String(e.subject).trim();
+          count++;
+        }
+      });
+      if (count === 0) throw new Error('時間割の科目が見つかりませんでした。');
+      setBulkCells(cells);
+      alert(`${count}件の科目をグリッドに反映しました。内容を確認して「まとめて保存」を押してください。`);
+    } catch (err) {
+      console.error(err);
+      setTimetableReadError(err instanceof Error ? err.message : '写真の読み取りに失敗しました。');
+    } finally {
+      setIsReadingTimetable(false);
+    }
+  };
+
   // Helper: Calculate remaining days
   const getRemainingDaysLabel = (targetDateStr: string) => {
     const todayDate = new Date();
@@ -840,6 +1005,54 @@ function App() {
                   </button>
                 </div>
 
+                {/* 基本受講スタイル（初期値）設定バー */}
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 bg-[#1a1d24] border border-white/5 p-3 rounded-2xl">
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs font-bold text-[#f8fafc]">基本の受講スタイル</span>
+                      <span className="text-[10px] text-[#94a3b8]">(新規登録時の初期値)</span>
+                    </div>
+                    <p className="text-[10px] text-[#64748b] mt-0.5">
+                      授業を追加するときに自動選択される受講形態を設定できます
+                    </p>
+                  </div>
+                  <div className="flex gap-1 bg-[#0f1115] p-1 rounded-xl border border-white/5 shrink-0">
+                    {[
+                      { type: 'zoom', label: '💻 Zoom' },
+                      { type: 'ondemand', label: '📺 オンデマンド' },
+                      { type: 'in_person', label: '🏫 対面' }
+                    ].map(opt => (
+                      <button
+                        key={opt.type}
+                        type="button"
+                        onClick={() => handleSetDefaultClassType(opt.type as ClassType)}
+                        className={`px-3 py-1.5 text-xs rounded-lg font-bold transition-all cursor-pointer ${
+                          defaultClassType === opt.type
+                            ? opt.type === 'zoom'
+                              ? 'bg-[#8b5cf6] text-white shadow-sm'
+                              : opt.type === 'ondemand'
+                              ? 'bg-[#10b981] text-white shadow-sm'
+                              : 'bg-[#4b88ff] text-white shadow-sm'
+                            : 'text-[#94a3b8] hover:text-[#f8fafc]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 既存の授業を一括変更するボタン */}
+                {timetable.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => handleUpdateAllClassType(defaultClassType)}
+                    className="w-full py-2 bg-[#8b5cf6]/10 hover:bg-[#8b5cf6]/20 border border-[#8b5cf6]/25 text-[#c4b5fd] rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                  >
+                    <span>⚡ 現在の時間割（{timetable.length}コマ）をすべて「{defaultClassType === 'zoom' ? '💻 Zoom' : defaultClassType === 'ondemand' ? '📺 オンデマンド' : '🏫 対面'}」に変更</span>
+                  </button>
+                )}
+
                 {isSchoolSyncEnabled && (
                   <button
                     type="button"
@@ -850,6 +1063,15 @@ function App() {
                     期間を選んで時間割をLife OSに登録
                   </button>
                 )}
+
+                <button
+                  type="button"
+                  onClick={openBulkEditTimetable}
+                  className="w-full py-2.5 bg-[#1a1d24] hover:bg-[#232733] text-[#f8fafc] font-bold rounded-xl text-xs border border-white/10 active:scale-[0.99] transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  時間割を一括入力（写真読み取り・まとめ入力）
+                </button>
 
                 {/* Timetable Grid */}
                 <div className="overflow-x-auto border border-white/5 rounded-2xl bg-[#1a1d24]">
@@ -900,7 +1122,19 @@ function App() {
                                   }}
                                   onClick={() => {
                                     if (isDraggingNow) return;
-                                    setEditingCell(item ? { ...item } : { day, period, subject: '', startTime: periodDefault.startTime, endTime: periodDefault.endTime });
+                                    setEditingCell(item ? {
+                                       ...item,
+                                       classType: item.classType || defaultClassType,
+                                       classroom: item.classroom || ''
+                                     } : {
+                                      day,
+                                      period,
+                                      subject: '',
+                                      startTime: periodDefault.startTime,
+                                      endTime: periodDefault.endTime,
+                                      classType: defaultClassType,
+                                      classroom: ''
+                                    });
                                   }}
                                   className={`p-1.5 border-r border-white/5 last:border-r-0 cursor-pointer transition-all ${
                                     isTargetOver
@@ -922,17 +1156,42 @@ function App() {
                                         setDragOverCell(null);
                                         setTimeout(() => setIsDraggingNow(false), 80);
                                       }}
-                                      className={`bg-[#4b88ff]/10 border border-[#4b88ff]/20 text-[#4b88ff] p-2 rounded-lg font-bold text-[10px] min-h-[56px] flex flex-col justify-center relative group cursor-grab active:cursor-grabbing hover:border-[#4b88ff]/40 hover:bg-[#4b88ff]/15 transition-all ${
+                                      className={`p-2 rounded-lg font-bold text-[10px] min-h-[64px] flex flex-col justify-between relative group cursor-grab active:cursor-grabbing transition-all ${
                                         isBeingDragged ? 'opacity-30 scale-95' : ''
+                                      } ${
+                                        item.classType === 'zoom'
+                                          ? 'bg-[#8b5cf6]/10 border border-[#8b5cf6]/25 text-[#a78bfa] hover:border-[#8b5cf6]/40 hover:bg-[#8b5cf6]/15'
+                                          : item.classType === 'ondemand'
+                                          ? 'bg-[#10b981]/10 border border-[#10b981]/25 text-[#34d399] hover:border-[#10b981]/40 hover:bg-[#10b981]/15'
+                                          : 'bg-[#4b88ff]/10 border border-[#4b88ff]/20 text-[#4b88ff] hover:border-[#4b88ff]/40 hover:bg-[#4b88ff]/15'
                                       }`}
                                     >
-                                      <div className="flex items-center justify-between gap-1">
-                                        <span className="line-clamp-2 text-left flex-1">{item.subject}</span>
-                                        <GripVertical className="w-2.5 h-2.5 opacity-30 group-hover:opacity-80 transition-opacity shrink-0 -mr-0.5" />
+                                      <div>
+                                        <div className="flex items-center justify-between gap-1">
+                                          <span className="line-clamp-2 text-left flex-1 text-[#f8fafc] font-semibold">{item.subject}</span>
+                                          <GripVertical className="w-2.5 h-2.5 opacity-30 group-hover:opacity-80 transition-opacity shrink-0 -mr-0.5 text-[#94a3b8]" />
+                                        </div>
+                                        {item.classroom && (
+                                          <div className="text-[8px] opacity-75 truncate text-left mt-0.5 flex items-center gap-0.5">
+                                            {item.classroom.startsWith("http") ? <ExternalLink className="w-2 h-2 shrink-0" /> : <MapPin className="w-2 h-2 shrink-0" />}
+                                            <span>{item.classroom.replace(/^https?:\/\//, "")}</span>
+                                          </div>
+                                        )}
                                       </div>
-                                      <div className="text-[8px] text-[#4b88ff]/80 font-normal mt-1 flex items-center justify-center gap-0.5">
-                                        <Clock className="w-2 h-2" />
-                                        {item.startTime} - {item.endTime}
+                                      <div className="mt-1 flex items-center justify-between gap-1 pt-1 border-t border-white/5">
+                                        <span className={`text-[8px] px-1 py-0.2 rounded font-medium ${
+                                          item.classType === 'zoom'
+                                            ? 'bg-[#8b5cf6]/25 text-[#c4b5fd]'
+                                            : item.classType === 'ondemand'
+                                            ? 'bg-[#10b981]/25 text-[#6ee7b7]'
+                                            : 'bg-[#4b88ff]/25 text-[#93c5fd]'
+                                        }`}>
+                                          {item.classType === 'zoom' ? '💻 Zoom' : item.classType === 'ondemand' ? '📺 オンデマンド' : '🏫 対面'}
+                                        </span>
+                                        <div className="text-[8px] opacity-75 font-normal flex items-center gap-0.5">
+                                          <Clock className="w-2 h-2" />
+                                          {item.startTime}
+                                        </div>
                                       </div>
                                     </div>
                                   ) : (
@@ -1260,7 +1519,19 @@ function App() {
                           <span className="font-semibold">{s.store}</span>
                           <span className="text-[#94a3b8] ml-2 text-[10px]">{formattedDate} ({s.workHours}h{s.breakMinutes > 0 ? ` / 休憩 ${s.breakMinutes}分` : ''})</span>
                         </div>
-                        <div className="font-bold text-[#34d399]">¥{s.estimatedPay.toLocaleString()}</div>
+                        <div className="flex items-center gap-3">
+                          <div className="font-bold text-[#34d399]">¥{s.estimatedPay.toLocaleString()}</div>
+                          <button
+                            onClick={() => {
+                              if (confirm('このシフトを削除しますか？')) {
+                                deleteShift(user.uid, s.id);
+                              }
+                            }}
+                            className="text-red-400/50 hover:text-red-400 p-1.5 hover:bg-red-500/5 rounded-full transition-all"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
@@ -1303,18 +1574,115 @@ function App() {
                   value={editingCell.subject}
                   onChange={e => setEditingCell({ ...editingCell, subject: e.target.value })}
                 />
-                <div className="flex flex-wrap gap-1.5 mt-2">
-                  {['英語', '数学', '国語', 'プログラミング', 'アルゴリズム', 'データベース', 'Web制作', 'ゼミ'].map(sub => (
-                    <button
-                      key={sub}
-                      type="button"
-                      onClick={() => setEditingCell({ ...editingCell, subject: sub })}
-                      className="px-2 py-1 text-[10px] bg-white/5 border border-white/5 hover:bg-white/10 hover:border-white/10 rounded-lg text-[#94a3b8] hover:text-[#f8fafc] transition-all cursor-pointer"
-                    >
-                      {sub}
-                    </button>
-                  ))}
+                <div className="flex flex-wrap gap-1.5 mt-2 max-h-36 overflow-y-auto pr-1">
+                  {(() => {
+                    const presetList = [
+                      'データベーススペシャリスト試験対策',
+                      '機械学習と深層学習理論',
+                      '機械学習プログラミング',
+                      'キャリアデザイン',
+                      '開発プロジェクト',
+                      '企業連携プロジェクト',
+                      'Web制作',
+                      'アルゴリズム',
+                      'データベース',
+                      'プログラミング',
+                      '英語',
+                      'ゼミ'
+                    ];
+                    // 時間割にすでに入っている科目も先頭に追加（自動学習）
+                    const registeredSubjects = timetable.map(t => t.subject).filter(Boolean);
+                    const allUniqueSubjects = Array.from(new Set([...registeredSubjects, ...presetList]));
+
+                    return allUniqueSubjects.map(sub => (
+                      <button
+                        key={sub}
+                        type="button"
+                        onClick={() => setEditingCell(prev => prev ? { ...prev, subject: sub } : null)}
+                        className={`px-2.5 py-1 text-[10px] rounded-lg border transition-all cursor-pointer ${
+                          editingCell?.subject === sub
+                            ? 'bg-[#4b88ff]/25 border-[#4b88ff] text-[#93c5fd] font-bold'
+                            : 'bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/10 text-[#94a3b8] hover:text-[#f8fafc]'
+                        }`}
+                      >
+                        {sub}
+                      </button>
+                    ));
+                  })()}
                 </div>
+              </div>
+
+              {/* 授業形態セレクター */}
+              <div>
+                <div className="flex justify-between items-center mb-2">
+                  <label className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider">
+                    授業形態 (受講スタイル)
+                  </label>
+                  {editingCell?.classType && editingCell.classType !== defaultClassType && (
+                    <button
+                      type="button"
+                      onClick={() => handleSetDefaultClassType(editingCell.classType!)}
+                      className="text-[9px] text-[#a78bfa] hover:underline cursor-pointer"
+                    >
+                      ★ これを基本スタイルにする
+                    </button>
+                  )}
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {[
+                    { type: 'in_person', label: '🏫 対面', sub: '登校' },
+                    { type: 'zoom', label: '💻 Zoom', sub: '配信' },
+                    { type: 'ondemand', label: '📺 オンデマンド', sub: '録画' }
+                  ].map(opt => {
+                    const isSelected = (editingCell?.classType || 'in_person') === opt.type;
+                    return (
+                      <button
+                        key={opt.type}
+                        type="button"
+                        onClick={() => setEditingCell(prev => prev ? { ...prev, classType: opt.type as ClassType } : null)}
+                        className={`py-2 px-1 rounded-xl text-center border transition-all cursor-pointer ${
+                          isSelected
+                            ? opt.type === 'zoom'
+                              ? 'bg-[#8b5cf6]/20 border-[#8b5cf6] text-[#c4b5fd] font-bold shadow-sm shadow-[#8b5cf6]/20'
+                              : opt.type === 'ondemand'
+                              ? 'bg-[#10b981]/20 border-[#10b981] text-[#6ee7b7] font-bold shadow-sm shadow-[#10b981]/20'
+                              : 'bg-[#4b88ff]/20 border-[#4b88ff] text-[#93c5fd] font-bold shadow-sm shadow-[#4b88ff]/20'
+                            : 'bg-[#0f1115] border-white/5 text-[#94a3b8] hover:text-[#f8fafc] hover:bg-white/[0.03]'
+                        }`}
+                      >
+                        <div className="text-xs">{opt.label}</div>
+                        <div className="text-[9px] opacity-60 mt-0.5">{opt.sub}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* 教室名 / Zoom・講義リンク */}
+              <div>
+                <div className="flex justify-between items-center mb-1.5">
+                  <label className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider">
+                    教室名 または Zoom/講義リンク (任意)
+                  </label>
+                </div>
+                <div className="relative">
+                  <input
+                    type="text"
+                    placeholder={
+                      editingCell?.classType === 'zoom'
+                        ? '例: https://zoom.us/j/... またはミーティングID'
+                        : editingCell?.classType === 'ondemand'
+                        ? '例: https://moodle... または講義ポータルURL'
+                        : '例: 3号館302教室 / 大講義室'
+                    }
+                    className="w-full px-4 py-2.5 bg-[#0f1115] border border-white/5 rounded-xl text-xs text-[#f8fafc] focus:outline-none focus:border-[#4b88ff]"
+                    value={editingCell?.classroom || ''}
+                    onChange={e => setEditingCell(prev => prev ? { ...prev, classroom: e.target.value } : null)}
+                  />
+                </div>
+                <p className="text-[9px] text-[#64748b] mt-1">
+                  💡 URLを入力すると、Life OS側からワンタップでZoomや講義ページを直接開けます！
+                </p>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1368,6 +1736,130 @@ function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* BULK TIMETABLE EDIT MODAL */}
+      {isBulkEditOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-[#1a1d24] border border-white/5 rounded-3xl p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center pb-2 border-b border-white/5">
+              <h3 className="font-extrabold text-sm text-[#f8fafc]">時間割 一括入力</h3>
+              <button
+                type="button"
+                onClick={() => setIsBulkEditOpen(false)}
+                className="text-[#94a3b8] hover:text-[#f8fafc] p-1 rounded-lg hover:bg-white/5 transition-all text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* 写真読み取り */}
+            <div className="space-y-2 bg-[#0f1115]/60 border border-white/5 rounded-2xl p-3">
+              <div className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider">📷 写真から読み取る（任意）</div>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={e => setTimetableImage(e.target.files?.[0] || null)}
+                className="w-full text-[10px] text-[#94a3b8] file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-white/5 file:text-[10px] file:text-[#f8fafc] cursor-pointer"
+              />
+              <input
+                type="password"
+                placeholder="Gemini APIキー（初回のみ・端末内に保存）"
+                value={geminiApiKey}
+                onChange={e => {
+                  setGeminiApiKey(e.target.value);
+                  localStorage.setItem('sw_gemini_api_key', e.target.value);
+                }}
+                className="w-full px-3 py-2 bg-[#0f1115] border border-white/5 rounded-xl text-[10px] text-[#f8fafc] focus:outline-none focus:border-[#4b88ff]"
+              />
+              <button
+                type="button"
+                disabled={isReadingTimetable || !timetableImage}
+                onClick={handleReadTimetablePhoto}
+                className="w-full py-2 bg-[#4b88ff]/15 hover:bg-[#4b88ff]/25 border border-[#4b88ff]/30 text-[#4b88ff] font-bold rounded-xl text-[11px] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {isReadingTimetable ? '読み取り中...' : '写真を読み取ってグリッドに反映'}
+              </button>
+              {timetableReadError && <p className="text-[10px] text-red-400">{timetableReadError}</p>}
+              <p className="text-[9px] text-[#94a3b8]/60 leading-relaxed">
+                読み取り後は下のグリッドで確認・修正してから保存できます。APIキーは <a href="https://aistudio.google.com/api-keys" target="_blank" rel="noreferrer" className="text-[#4b88ff] hover:underline">Google AI Studio</a> で無料取得できます（キーはこの端末にのみ保存されます）。
+              </p>
+            </div>
+
+            {/* テキスト貼り付け */}
+            <div className="space-y-2 bg-[#0f1115]/60 border border-white/5 rounded-2xl p-3">
+              <div className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider">📋 テキストから貼り付け（任意）</div>
+              <textarea
+                value={bulkPasteText}
+                onChange={e => setBulkPasteText(e.target.value)}
+                rows={4}
+                placeholder={'月 1 英語\n月 2 数学'}
+                className="w-full px-3 py-2 bg-[#0f1115] border border-white/5 rounded-xl text-[10px] text-[#f8fafc] focus:outline-none focus:border-[#4b88ff] font-mono"
+              />
+              <button
+                type="button"
+                onClick={applyBulkPasteText}
+                className="w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 text-[#f8fafc] font-bold rounded-xl text-[11px] transition-all"
+              >
+                テキストをグリッドに反映
+              </button>
+              <p className="text-[9px] text-[#94a3b8]/60 leading-relaxed">1行に「曜日 限 科目名」の順で（空白・カンマ区切り）。例: 火 3 プログラミング</p>
+            </div>
+
+            {/* グリッド直接入力 */}
+            <div>
+              <div className="text-[10px] font-bold text-[#94a3b8] uppercase tracking-wider mb-2">✏️ グリッドで直接入力</div>
+              <div className="overflow-x-auto border border-white/5 rounded-2xl bg-[#1a1d24]">
+                <table className="w-full border-collapse text-xs min-w-[320px]">
+                  <thead>
+                    <tr className="border-b border-white/5 bg-[#0f1115]/40 text-[#94a3b8] font-bold">
+                      <th className="py-2 w-10 border-r border-white/5 text-[10px]">限</th>
+                      {weekdays.map(day => (
+                        <th key={day} className="py-2 border-r border-white/5 last:border-r-0 text-[10px]">{day}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {periods.map(period => (
+                      <tr key={period} className="border-b border-white/5 last:border-b-0">
+                        <td className="py-1 px-1 text-[10px] font-bold text-[#94a3b8] border-r border-white/5 bg-[#0f1115]/20 text-center">{period}限</td>
+                        {weekdays.map(day => (
+                          <td key={day} className="p-0.5 border-r border-white/5 last:border-r-0">
+                            <input
+                              type="text"
+                              value={bulkCells[`${day}-${period}`] || ''}
+                              onChange={e => setBulkCells({ ...bulkCells, [`${day}-${period}`]: e.target.value })}
+                              placeholder="—"
+                              className="w-full min-w-0 px-1 py-1.5 bg-[#0f1115] border border-white/5 rounded-md text-[10px] text-[#f8fafc] focus:outline-none focus:border-[#4b88ff] text-center"
+                            />
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[9px] text-[#94a3b8]/60 mt-2">授業時間は標準時間（1限: 09:10〜 など）で登録されます。個別に変えたい場合は保存後にセルをタップして編集できます。</p>
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setIsBulkEditOpen(false)}
+                className="flex-1 py-2.5 bg-[#1a1d24] text-xs font-bold rounded-xl border border-white/5 text-[#94a3b8] hover:text-[#f8fafc] transition-all"
+              >
+                キャンセル
+              </button>
+              <button
+                type="button"
+                onClick={handleBulkSaveTimetable}
+                className="flex-1 py-2.5 bg-[#4b88ff] text-white font-bold rounded-xl text-xs shadow-md shadow-[#4b88ff]/10 active:scale-[0.98] transition-all"
+              >
+                まとめて保存
+              </button>
+            </div>
           </div>
         </div>
       )}

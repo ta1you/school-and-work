@@ -8,8 +8,11 @@ import {
   setDoc, 
   addDoc, 
   deleteDoc,
-  updateDoc
+  updateDoc,
+  writeBatch
 } from 'firebase/firestore';
+
+export type ClassType = 'in_person' | 'zoom' | 'ondemand' | 'other';
 
 export interface TimetableItem {
   id: string;
@@ -18,6 +21,8 @@ export interface TimetableItem {
   subject: string;
   startTime: string;
   endTime: string;
+  classType?: ClassType; // 'in_person' (対面) | 'zoom' (Zoom) | 'ondemand' (オンデマンド) | 'other' (その他)
+  classroom?: string;    // 教室名・Zoom/講義リンク・メモ
 }
 
 export interface Assignment {
@@ -57,6 +62,7 @@ interface AppState {
   cleanup: () => void;
 
   saveTimetableCell: (uid: string, item: Omit<TimetableItem, 'id'> & { id?: string }) => Promise<void>;
+  updateAllTimetableClassType: (uid: string, classType: ClassType) => Promise<number>;
   deleteTimetableCell: (uid: string, id: string) => Promise<void>;
   registerTimetableForDates: (uid: string, timetable: TimetableItem[], targetDates: { day: string; date: Date }[]) => Promise<number>;
   deleteTimetableForDates: (uid: string, timetable: TimetableItem[], targetDates: { day: string; date: Date }[]) => Promise<number>;
@@ -127,29 +133,39 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   saveTimetableCell: async (uid, item) => {
+    const dataToSave = {
+      day: item.day,
+      period: item.period,
+      subject: item.subject,
+      startTime: item.startTime,
+      endTime: item.endTime,
+      classType: item.classType || 'in_person',
+      classroom: item.classroom || ''
+    };
+
     if (item.id) {
       const docRef = doc(db, 'school', uid, 'timetable', item.id);
-      await setDoc(docRef, {
-        day: item.day,
-        period: item.period,
-        subject: item.subject,
-        startTime: item.startTime,
-        endTime: item.endTime
-      });
+      await setDoc(docRef, dataToSave);
     } else {
       const colRef = collection(db, 'school', uid, 'timetable');
-      await addDoc(colRef, {
-        day: item.day,
-        period: item.period,
-        subject: item.subject,
-        startTime: item.startTime,
-        endTime: item.endTime
-      });
+      await addDoc(colRef, dataToSave);
     }
   },
 
   deleteTimetableCell: async (uid, id) => {
     await deleteDoc(doc(db, 'school', uid, 'timetable', id));
+  },
+
+  updateAllTimetableClassType: async (uid, classType) => {
+    const timetable = get().timetable;
+    if (timetable.length === 0) return 0;
+    const batch = writeBatch(db);
+    timetable.forEach(item => {
+      const docRef = doc(db, 'school', uid, 'timetable', item.id);
+      batch.update(docRef, { classType });
+    });
+    await batch.commit();
+    return timetable.length;
   },
 
   registerTimetableForDates: async (uid, timetable, targetDates) => {
@@ -160,16 +176,21 @@ export const useAppStore = create<AppState>((set, get) => ({
         count++;
         const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
         const scheduleRef = doc(db, 'users', uid, 'schedules', `school-${dateKey}-${item.id}`);
+        const classType = item.classType || 'in_person';
+        const color = classType === 'zoom' ? '#8b5cf6' : classType === 'ondemand' ? '#10b981' : '#3b82f6';
+
         return setDoc(scheduleRef, {
           title: `${item.subject} (学校)`,
           timeStart: item.startTime,
           timeEnd: item.endTime,
-          color: '#3b82f6',
+          color,
           date: date.toISOString(),
           isSchool: true,
           source: 'school-timetable',
           timetableId: item.id,
-          registeredDate: dateKey
+          registeredDate: dateKey,
+          classType,
+          classroom: item.classroom || ''
         });
       });
     });
